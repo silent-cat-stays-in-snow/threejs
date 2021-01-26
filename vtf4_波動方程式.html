@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ja">
+    <head>
+        <meta charset="utf-8" />
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                overflow: hidden;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="target"></div>
+        <script src="three.js-master/build/three.min.js"></script>
+        <script src="three.js-master/examples/js/controls/OrbitControls.js"></script>
+        <script src="GPUComputationRenderer.js"></script>
+        <script src="minMatrixb.js"></script>
+        <script id="computeShaderPosition" type="x-shader/x-fragment">
+            // 現在の位置情報を決定する
+            #define delta ( 1.0 / 60.0 )
+
+            void main() {
+                vec2 uv = gl_FragCoord.xy / resolution.xy;
+                vec3 pos = texture2D( texturePosition, uv ).xyz;
+                vec3 height = texture2D( textureHeight, uv ).xyz;
+
+                // 移動する方向に速度を掛け合わせた数値を現在地に加える。
+                gl_FragColor = vec4( pos.x, height.x, pos.z, 1.0 );
+            }
+        </script>
+
+        <script id="computeShaderHeight" type="x-shader/x-fragment">
+            // 波の高さ、速度を保持するシェーダ（x = 波の高さ, y = 速度）
+            vec4 tex(vec2 uv) {
+                return texture2D( textureHeight, uv );
+            }
+
+            void main() {
+                vec2 uv = gl_FragCoord.xy / resolution.xy;
+                vec2 pixel = 1.0 / resolution.xy;
+
+                float accel = tex(uv + pixel * vec2(1, 0)).x + 
+                              tex(uv - pixel * vec2(1, 0)).x +
+                              tex(uv + pixel * vec2(0, 1)).x + 
+                              tex(uv - pixel * vec2(0, 1)).x -
+                              tex(uv).x * 4.0;
+
+                accel *= 0.5;
+
+                float speed = (tex(uv).y + accel) * 0.999;
+
+                gl_FragColor = vec4(tex(uv).x + speed, speed, .0, .0);
+            }
+        </script>
+
+
+        <!-- Particles vertex shader -->
+        <script type="x-shader/x-vertex" id="particleVertexShader">
+            #include <common>
+            uniform sampler2D texturePosition;
+            uniform float cameraConstant;
+            uniform float density;
+            varying vec2 vUv;
+            varying vec3 vPos;
+            uniform float radius;
+
+            void main() {
+                vec3 pos = texture2D( texturePosition, uv ).xyz;
+
+                // ポイントのサイズを決定
+                vec4 mvPosition = modelViewMatrix * vec4( pos, 1.0 );
+                gl_PointSize = rand(uv) * 2.42 * cameraConstant / ( - mvPosition.z );
+
+                // uv情報の引き渡し
+                vUv = uv;
+
+                vPos = pos;
+
+                // 変換して格納
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        </script>
+
+        <!-- Particles fragment shader -->
+        <script type="x-shader/x-fragment" id="particleFragmentShader">
+                uniform float time;
+                varying vec2 vUv;
+                varying vec3 vPos;
+
+                void main() {
+                    gl_FragColor = vec4(vec3(0.02, 0.4, 0.72) * clamp(vec3(vPos.y), 0.4, 1.0), 1.0);
+                }
+        </script>
+        <script>
+        (async()=>{
+        const scene = new THREE.Scene();
+        const renderer = new THREE.WebGLRenderer();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 5, 15000);
+        camera.position.x = 0;
+        camera.position.y = 300;
+        camera.position.z = 600;
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setClearColor( 0x000000 );
+        renderer.setPixelRatio( window.devicePixelRatio );
+        document.getElementById("target").appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+        const WIDTH = 500;
+        const PARTICLES = WIDTH * WIDTH;
+
+        const gpuCompute = new GPUComputationRenderer(WIDTH, WIDTH, renderer);
+
+        const destPos = gpuCompute.createTexture();
+        const destHeight = gpuCompute.createTexture();
+
+        const posArray = destPos.image.data;
+        const heightArray = destHeight.image.data;
+
+        // 位置の初期化
+        for(let j = 0; j < 500; j++) {
+            for(let n = 0; n < 500; n++){
+                posArray[j * 2000 + n * 4] = (j - 250) * 2;
+                posArray[j * 2000 + n * 4 + 1] = 0;
+                posArray[j * 2000 + n * 4 + 2] = (n - 250) * 2;
+                posArray[j * 2000 + n * 4 + 3] = 0;
+            }
+        }
+
+        // 波の高さの初期化
+        for(let n = 0, l = heightArray.length; n < l; n++) {
+            heightArray[n] = 0;
+        }
+        heightArray[0] = 1000;
+
+        const positionVariable = gpuCompute.addVariable( "texturePosition", document.getElementById( 'computeShaderPosition' ).textContent, destPos);
+        const heightVariable   = gpuCompute.addVariable( "textureHeight"  , document.getElementById( 'computeShaderHeight'   ).textContent, destHeight);
+
+        // 一連の関係性を構築するためのおまじない
+        gpuCompute.setVariableDependencies( positionVariable, [ positionVariable, heightVariable ] );
+        gpuCompute.setVariableDependencies( heightVariable,   [ positionVariable, heightVariable ] );     
+
+        // error処理
+        const error = gpuCompute.init();
+        if ( error !== null ) {
+            console.error( error );
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array( PARTICLES * 3 );
+        let p = 0;
+        for ( let i = 0; i < PARTICLES; i++ ) {
+            positions[ p++ ] = 0;
+            positions[ p++ ] = 0;
+            positions[ p++ ] = 0;
+        }
+
+        // uv情報の決定。テクスチャから情報を取り出すときに必要
+        const uvs = new Float32Array( PARTICLES * 2 );
+        p = 0;
+        for ( let j = 0; j < WIDTH; j++ ) {
+            for (let i = 0; i < WIDTH; i++ ) {
+                uvs[ p++ ] = i / ( WIDTH - 1 );
+                uvs[ p++ ] = j / ( WIDTH - 1 );
+            }
+        }
+
+        // attributeをgeometryに登録する
+        geometry.addAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+        geometry.addAttribute( 'uv', new THREE.BufferAttribute( uvs, 2 ) );
+
+        // uniform変数をオブジェクトで定義
+        // 今回はカメラをマウスでいじれるように、計算に必要な情報もわたす。
+        const particleUniforms = {
+            texturePosition: { value: null },
+            textureHeight:   { value: null },
+            cameraConstant: { value: getCameraConstant( camera ) },
+            time: { value: 0.0 }
+        };
+
+        // Shaderマテリアル これはパーティクルそのものの描写に必要なシェーダー
+        const material = new THREE.ShaderMaterial( {
+            uniforms:       particleUniforms,
+            vertexShader:   document.getElementById( 'particleVertexShader' ).textContent,
+            fragmentShader: document.getElementById( 'particleFragmentShader' ).textContent,
+            blending: THREE.AdditiveBlending
+        });
+        material.extensions.drawBuffers = true;
+        const particles = new THREE.Points( geometry, material );
+        particles.matrixAutoUpdate = false;
+        particles.updateMatrix();
+
+        // パーティクルをシーンに追加
+        scene.add( particles );
+
+        const beginDate = new Date();
+
+        (function render() {
+            requestAnimationFrame(render);
+
+            gpuCompute.compute();
+
+            material.uniforms.time.value += (beginDate - new Date()) * 0.0000003;
+
+            // Three.js用のGPGPUライブラリでは、以下のように現在の情報を保存することができる。
+            particleUniforms.texturePosition.value = gpuCompute.getCurrentRenderTarget( positionVariable ).texture;
+            particleUniforms.textureHeight.value = gpuCompute.getCurrentRenderTarget( heightVariable ).texture;
+            renderer.render(scene, camera);
+        }());
+
+
+        function getCameraConstant( camera ) {
+            return window.innerHeight / ( Math.tan( THREE.Math.DEG2RAD * 0.5 * camera.fov ) / camera.zoom );
+        }
+
+        function getImageColorVec4Array(src) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.src = src;
+                img.addEventListener("load", e => {
+                    const dest = new Float32Array(img.width * img.height * 4);
+                    const canvas = document.createElement("canvas");
+                    const ctx = canvas.getContext("2d");
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+
+                    const rad = 90 * Math.PI / 180;
+
+                    ctx.setTransform(Math.cos(rad), Math.sin(rad), -Math.sin(rad), Math.cos(rad), canvas.width / 2, canvas.height / 2);
+                    ctx.translate(-canvas.width / 2, -canvas.height / 2);
+                    ctx.drawImage(img, 0, 0);
+
+                    const data = ctx.getImageData(0, 0, img.width, img.height).data;
+
+                    // rgbaからvec4に変換
+                    for(let i = 0, l = data.length; i < l; i++){
+                        dest[i] = (data[i] / 255);
+                    }
+
+                    resolve(dest);
+                });
+            });
+        }
+
+        })();
+        </script>
+    </body>
+</html>
